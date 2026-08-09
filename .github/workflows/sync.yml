@@ -1,0 +1,59 @@
+name: Weekly Sync + Build
+
+on:
+  schedule:
+    - cron: '0 10 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "Hermes Sync Bot"
+          git config user.email "sync@hermes-agent.local"
+
+      - name: Sync upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          git merge upstream/main --no-edit --allow-unrelated-histories || true
+          # GITHUB_TOKEN has no workflows permission - restore our own workflow
+          # files so upstream's workflow changes don't break the push.
+          git checkout origin/main -- .github/workflows/ || true
+
+      - name: Commit and push
+        run: |
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "chore: sync upstream"
+            git push origin main --force-with-lease
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

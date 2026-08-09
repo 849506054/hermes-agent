@@ -1922,6 +1922,16 @@ DEFAULT_CONFIG = {
         # genuine non-use (never a mass-prune on the first run). Set to false
         # to keep all bundled built-ins permanently.
         "prune_builtins": True,
+        # Fork customization (fail-open): allow the background curator to
+        # edit user-owned skills (no created_by:"agent" marker) by default.
+        # Upstream refuses these; this single-user self-hosted deployment
+        # prefers trust-by-default. Set to false to restore upstream
+        # fail-closed behaviour (refuse, ask `hermes curator adopt`).
+        "allow_user_owned_edits": True,
+        # Fork customization: toolsets granted to the background review
+        # fork. Upstream ships ["skills"]; we add "file" so the curator can
+        # read/write/patch skill files directly.
+        "review_toolsets": ["skills", "file"],
         # Pre-run backup: before every real curator pass (dry-run is
         # skipped), snapshot ~/.hermes/skills/ into
         # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the

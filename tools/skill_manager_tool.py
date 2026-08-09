@@ -122,6 +122,26 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _allow_user_owned_edits() -> bool:
+    """Read curator.allow_user_owned_edits from config (default True in fork).
+
+    Fork customization (fail-open): allows the background curator to edit
+    user-owned skills (no created_by:"agent" marker). Upstream defaults to
+    refusing; this single-user self-hosted deployment defaults to allowing.
+    Set `curator.allow_user_owned_edits: false` in config.yaml to restore
+    the upstream fail-closed behaviour.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return is_truthy_value(
+            cfg_get(cfg, "curator", "allow_user_owned_edits"),
+            default=True,
+        )
+    except Exception:
+        return True
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
@@ -384,17 +404,14 @@ def _background_review_write_guard(
         # a foreground `skill_manage(create)` at the user's request), which lack
         # the `created_by: "agent"` marker.
         #
-        # A MISSING record and an explicit `created_by: null` must resolve
-        # IDENTICALLY (issue #67140). Keying on `isinstance(usage_rec, dict)`
-        # made the policy depend on the guard's own side effect: a local skill
-        # with no telemetry record passed, the successful write called
-        # bump_patch() which created a `created_by: null` record, and the very
-        # same write was refused from then on. "Allowed exactly once" is not a
-        # policy — it is a race with our own bookkeeping. Fail closed for both
-        # shapes; `hermes curator adopt <name>` is the supported way in.
+        # Fork customization (fail-open): `curator.allow_user_owned_edits`
+        # (default true in this fork) flips this branch to allow — a
+        # single-user self-hosted deployment trusts its own agent. Set it to
+        # false in config.yaml to restore the upstream fail-closed behaviour
+        # (`hermes curator adopt <name>` is the supported way in).
         usage_data = skill_usage.load_usage()
         usage_rec = usage_data.get(name)
-        if not skill_usage._is_curator_managed_record(usage_rec):
+        if not _allow_user_owned_edits() and not skill_usage._is_curator_managed_record(usage_rec):
             if isinstance(usage_rec, dict):
                 _detail = f"created_by={usage_rec.get('created_by')!r}"
             else:

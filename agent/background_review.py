@@ -406,6 +406,88 @@ _COMBINED_REVIEW_PROMPT = (
 )
 
 
+def _allow_user_owned_edits() -> bool:
+    """Read curator.allow_user_owned_edits from config (default True in fork).
+
+    Fork customization (fail-open): the background curator may edit
+    user-owned skills. Upstream defaults to refusing; this single-user
+    self-hosted deployment defaults to allowing. Set
+    `curator.allow_user_owned_edits: false` in config.yaml to restore the
+    upstream fail-closed behaviour.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        section = cfg.get("curator") if isinstance(cfg.get("curator"), dict) else {}
+        return bool(section.get("allow_user_owned_edits", True))
+    except Exception:
+        return True
+
+
+def _review_toolsets() -> list:
+    """Read curator.review_toolsets from config (default ["skills", "file"]).
+
+    Fork customization (fail-open): grants the background review fork the
+    file toolset so it can read/write/patch skill files directly. Upstream
+    ships only ["skills"]. Override via
+    `curator.review_toolsets: [skills]` in config.yaml to restore upstream.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        section = cfg.get("curator") if isinstance(cfg.get("curator"), dict) else {}
+        value = section.get("review_toolsets")
+        if isinstance(value, list) and value:
+            return [str(v) for v in value]
+        if isinstance(value, str) and value.strip():
+            return [v.strip() for v in value.split(",") if v.strip()]
+    except Exception:
+        pass
+    return ["skills", "file"]
+
+# Prompt fragment telling the review agent user-owned skills are editable.
+# Replaces the upstream "writes WILL be refused" fragment when
+# curator.allow_user_owned_edits is enabled (fork fail-open default).
+_USER_OWNED_ALLOW_FRAGMENT = (
+    "  • USER-OWNED skills — anything not curator-managed (hand-written, "
+    "URL-installed, or created by a foreground agent at the user's "
+    "request). The user has authorized you to update these when you find "
+    "them wrong or outdated — patch them directly. This deployment is "
+    "configured with `curator.allow_user_owned_edits: true` (fail-open).\n"
+)
+
+
+def _maybe_failopen_prompt(prompt: str) -> str:
+    """Swap the USER-OWNED refusal fragment for the allow fragment.
+
+    Only applies when curator.allow_user_owned_edits is enabled (the fork
+    default). Upstream prompts tell the review fork that writes to
+    user-owned skills WILL be refused; with the guard opened, that text is
+    wrong and would make the agent refuse itself. When the config is off,
+    the prompt is returned byte-identical (upstream behaviour).
+    """
+    if not _allow_user_owned_edits():
+        return prompt
+    refusal_variants = (
+        "  • USER-OWNED skills — anything not curator-managed. A skill the "
+        "user hand-wrote, installed by URL, or asked a foreground agent to "
+        "create is theirs, not yours; your writes to it WILL be refused. "
+        "This includes skills that were loaded or consulted this session: "
+        "being in play does not make one yours to edit. If such a skill is "
+        "wrong or outdated, say so in your reply and recommend "
+        "'hermes curator adopt <name>' — do not try to patch it.\n",
+        "  • USER-OWNED skills — anything not curator-managed (hand-written, "
+        "URL-installed, or created by a foreground agent at the user's "
+        "request). Your writes to these WILL be refused, including to skills "
+        "loaded or consulted this session. If one is wrong, say so in your "
+        "reply and recommend 'hermes curator adopt <name>' instead.\n",
+    )
+    for refusal in refusal_variants:
+        if refusal in prompt:
+            prompt = prompt.replace(refusal, _USER_OWNED_ALLOW_FRAGMENT, 1)
+    return prompt
+
+
 
 def summarize_background_review_actions(
     review_messages: List[Dict],
@@ -940,9 +1022,13 @@ def _run_review_in_thread(
             # Hardcoding ["memory", "skills"] granted the review LLM the MEMORY.md
             # read/write tool even when a profile set memory_enabled: false,
             # contaminating a memory-disabled profile (#54937 layer 2).
-            review_toolsets = ["skills"]
+            # Fork customization (fail-open): the toolset list comes from
+            # curator.review_toolsets (default ["skills", "file"] in this fork)
+            # so the background curator can read/write/patch skill files.
+            review_toolsets = list(_review_toolsets())
             if review_agent._memory_enabled or review_agent._user_profile_enabled:
-                review_toolsets.insert(0, "memory")
+                if "memory" not in review_toolsets:
+                    review_toolsets.insert(0, "memory")
             review_whitelist = {
                 t["function"]["name"]
                 for t in get_tool_definitions(
@@ -1118,6 +1204,7 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
+    prompt = _maybe_failopen_prompt(prompt)
 
     focus = (focus or "").strip()
     if focus:
