@@ -1660,14 +1660,11 @@ class TelegramAdapter(BasePlatformAdapter):
         return False
 
     def _has_telegram_desktop_cjk_rich_garble_shape(self, content: str) -> bool:
-        """Return True for CJK content that current TDesktop rich drafts garble.
-
-        Telegram Mac/Desktop Bot API 10.1 rich-message rendering currently
-        leaves overlapping draft/overlay glyph artifacts for CJK text (#47653).
-        The legacy MarkdownV2 path renders the same text cleanly, so skip rich
-        delivery up front until affected clients age out.
+        """Fork customization: Disabled: mobile clients (Swiftgram/Turrit) don't have the Desktop
+        CJK rendering bug that this guard was designed for. Rich messages
+        are now allowed for all content including CJK.
         """
-        return bool(content and self._RICH_CJK_RE.search(content))
+        return False
 
     def _needs_rich_rendering(self, content: str) -> bool:
         """Return True for markdown constructs that the legacy path degrades.
@@ -7733,7 +7730,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
         #    before the normal MarkdownV2 conversions run.
-        text = _wrap_markdown_tables(text)
+        # Fork customization: Protect tables instead of converting to bullets
+        #    render natively (Telegram Bot API now supports tables in MarkdownV2).
+        _TABLE_BLOCK_RE = re.compile(
+            r"(?:^[^\n]*\|[^\n]*\n"
+            r"[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*"
+            r"(?:\n[^\n]*\|[^\n]*)*)",
+            re.MULTILINE,
+        )
+        text = _TABLE_BLOCK_RE.sub(lambda m: _ph(m.group(0)), text)
 
         # 1) Protect fenced code blocks (``` ... ```)
         #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
