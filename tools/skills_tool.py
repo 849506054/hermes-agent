@@ -1114,7 +1114,41 @@ def skill_view(
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
             plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
@@ -2022,6 +2056,23 @@ def _skill_view_with_bump(args, **kw):
     # so a post-compression re-view returns full content again.
     stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
+        # Dedup hit means the exact file content is already fully present
+        # earlier in this conversation — that satisfies read-before-write.
+        # Record the read so background-review forks may patch skills they
+        # have already loaded without tripping the guard (the stub itself
+        # carries no content, so without this the guard sees "not loaded").
+        # (fork 849506054: skill_view dedup read-before-write fix)
+        try:
+            from tools.skill_manager_tool import (
+                _find_skill,
+                mark_background_review_skill_read,
+            )
+            existing = _find_skill(name)
+            if existing:
+                target = Path(existing["path"]) / (args.get("file_path") or "SKILL.md")
+                mark_background_review_skill_read(target)
+        except Exception:
+            pass
         return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id

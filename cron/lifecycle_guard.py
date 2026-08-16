@@ -105,6 +105,10 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+# Heredoc opener token, post-shlex (quotes/backslash already stripped):
+# `<<DELIM`, `<<-DELIM`. The delimiter word is [A-Za-z_][A-Za-z0-9_]* per
+# POSIX (a quoted delimiter like <<'EOF' tokenizes to the same <<EOF form).
+_HEREDOC_OPENER_RE = re.compile(r"^<<-?([A-Za-z_][A-Za-z0-9_]*)$")
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -152,9 +156,27 @@ _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments, honoring quotes and comments."""
+    """Yield shell-tokenized command segments, honoring quotes and comments.
+
+    Heredoc bodies (``<<DELIM`` … ``DELIM``) are DATA, not commands: skipping
+    them prevents innocent data lines (``Path('/opt/data/config.yaml')`` in
+    a Python heredoc, etc.) from being tokenized as standalone segments and
+    then misread as referenced scripts by ``_iter_referenced_shell_scripts``
+    (fork 849506054: lifecycle-guard heredoc false-positive fix). Safety is
+    not reduced: the top-level
+    ``_direct_lifecycle_scan`` regex still runs over the ENTIRE command text
+    (heredoc body included), so a real ``hermes gateway restart`` inside a
+    heredoc is still blocked.
+    """
     normalized = command.replace("\\\n", "")
+    heredoc_delimiter: Optional[str] = None
     for line in normalized.splitlines() or [normalized]:
+        if heredoc_delimiter is not None:
+            # Heredoc body: data, not commands. Match the delimiter line
+            # (``<<-`` allows leading tabs, so strip before comparing).
+            if line.strip() == heredoc_delimiter:
+                heredoc_delimiter = None
+            continue
         try:
             lexer = shlex.shlex(
                 line,
@@ -175,6 +197,11 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                     segment = []
                 continue
             segment.append(token)
+            # Heredoc opener (quotes/backslash already stripped by shlex):
+            # `<<DELIM`, `<<'DELIM'`, `<<\DELIM`, `<<-DELIM`.
+            opener = _HEREDOC_OPENER_RE.match(token)
+            if opener:
+                heredoc_delimiter = opener.group(1)
         if segment:
             yield segment
 

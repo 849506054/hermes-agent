@@ -51,6 +51,16 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+# Hermes session id (observability identity, distinct from the gateway
+# routing session_key above). Approval hooks forward it so observer
+# plugins can attach approval marks to the REAL session scope — without
+# it they fall back to a synthetic "default" session whose scope never
+# closes, and close-time exporters never ship the marks (staging defect
+# 2026-08-10: approvals invisible on the audit board).
+_approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_id",
+    default="",
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -113,6 +123,12 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     try:
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        # Forward the Hermes session id so observer plugins parent approval
+        # marks to the real session scope instead of a synthetic "default"
+        # session (whose scope never closes → marks never export).
+        _session_id = _approval_session_id.get()
+        if _session_id:
+            kwargs.setdefault("session_id", _session_id)
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -183,19 +199,26 @@ def set_current_observability_context(
     *,
     turn_id: str = "",
     tool_call_id: str = "",
-) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    session_id: str = "",
+) -> tuple[
+    contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]
+]:
     """Bind active tool correlation IDs to approval hooks."""
     return (
         _approval_turn_id.set(turn_id or ""),
         _approval_tool_call_id.set(tool_call_id or ""),
+        _approval_session_id.set(session_id or ""),
     )
 
 
 def reset_current_observability_context(
-    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+    tokens: tuple[
+        contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]
+    ],
 ) -> None:
     """Restore prior approval hook correlation IDs."""
-    turn_token, tool_token = tokens
+    turn_token, tool_token, session_token = tokens
+    _approval_session_id.reset(session_token)
     _approval_tool_call_id.reset(tool_token)
     _approval_turn_id.reset(turn_token)
 
@@ -724,6 +747,55 @@ DANGEROUS_PATTERNS = [
     # "del"/"rm" (e.g. `-File c:\del-logs\run.ps1`) is not.
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+(?:-(?:command|c)\s+)?["\']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b', "Windows PowerShell destructive delete"),
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b', "PowerShell encoded command execution"),
+    # ── Windows destructive tier (#69472) ────────────────────────────────
+    # These are native Windows EXEs / cmdlets reachable from ANY Hermes
+    # terminal backend on a Windows host — including the default git-bash
+    # backend (taskkill.exe, icacls.exe, reg.exe, vssadmin.exe, bcdedit.exe,
+    # cipher.exe are ordinary PATH executables there). Detection input is
+    # lowercased by the variant loop, so patterns are written lowercase.
+    # Each pattern requires the destructive flag/verb so benign usage
+    # (`taskkill /IM app.exe` graceful kill, `reg query`, `icacls file`)
+    # does NOT prompt.
+    # Bare PowerShell destructive delete: Remove-Item/ri with -Recurse or
+    # -Force. The cmd/powershell-prefixed forms are covered above; this
+    # catches the bare form (ACP clients, pwsh-default SSH hosts, or
+    # `powershell` invoked earlier in a compound command).
+    (r'\bremove-item\b[^\n;|&]*\s-(?:recurse|force)\b', "PowerShell destructive delete (Remove-Item)"),
+    # cmd builtins with destructive switches, bare form: del/erase/rd/rmdir
+    # with /s (recurse) or /q (quiet). Requires the switch so `del file.txt`
+    # inside a cmd /c string stays covered by the prefixed rule only.
+    (r'\b(?:del|erase|rd|rmdir)\s+(?:/[a-z]\s+)*/[sq]\b', "Windows destructive delete (recursive/quiet switch)"),
+    # Remote content piped to Invoke-Expression — PowerShell's `curl | sh`.
+    (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*\|\s*(?:iex|invoke-expression)\b', "pipe remote content to PowerShell (iwr | iex)"),
+    (r'\b(?:iex|invoke-expression)\s*\(\s*(?:iwr|invoke-webrequest|invoke-restmethod|irm)\b', "execute remote content via Invoke-Expression"),
+    # Force process kills — Windows analogue of pkill -9.
+    (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
+    (r'\bstop-process\b[^\n]*\s-force\b', "force kill processes (Stop-Process -Force)"),
+    # Volume/disk destruction — Windows analogue of mkfs / dd.
+    (r'\bformat-volume\b', "format filesystem (Format-Volume)"),
+    (r'\bclear-disk\b', "wipe disk (Clear-Disk)"),
+    (r'\bdiskpart\b', "disk partitioning (diskpart)"),
+    (r'\bformat(?:\.com)?\s+[a-z]:', "format drive (format.com)"),
+    (r'\bcipher\s+/w\b', "wipe free space (cipher /w)"),
+    # ACL destruction — Windows analogue of chmod 777.
+    (r'\bicacls\b[^\n]*\s/grant\b[^\n]*\b(?:everyone|todos|jeder|tout\s+le\s+monde|\*s-1-1-0)\b', "grant Everyone access (icacls)"),
+    (r'\bicacls\b[^\n]*\s/reset\b', "reset ACLs recursively (icacls /reset)"),
+    # Backup/recovery destruction — classic ransomware prep, no benign
+    # agent use case.
+    (r'\bvssadmin\b[^\n]*\bdelete\s+shadows\b', "delete volume shadow copies (vssadmin)"),
+    (r'\bwbadmin\b[^\n]*\bdelete\b', "delete backups (wbadmin)"),
+    (r'\bbcdedit\b[^\n]*\s/set\b', "modify boot configuration (bcdedit /set)"),
+    # Registry deletion with force flag.
+    (r'\breg(?:\.exe)?\s+delete\b', "registry delete (reg delete)"),
+    (r'\bremove-itemproperty\b[^\n]*\s-force\b', "registry value delete (Remove-ItemProperty -Force)"),
+    # Windows service/system stop — analogue of systemctl stop.
+    (r'\bstop-service\b[^\n]*\s-force\b', "force stop service (Stop-Service -Force)"),
+    (r'\bsc(?:\.exe)?\s+(?:stop|delete)\b', "stop/delete service (sc)"),
+    # Credential/key paths in Windows form — the POSIX ~/.ssh patterns never
+    # match drive-letter or backslash spellings. Match both separators.
+    (r'\busers[\\/][^\\/\s]+[\\/]\.ssh\b', "access to SSH keys (Windows path)"),
+    (r'\bappdata[\\/](?:local|roaming)[\\/]hermes[^\n]*\.env\b', "access to Hermes secrets (Windows path)"),
+    # ─────────────────────────────────────────────────────────────────────
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
@@ -1000,6 +1072,72 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
+def _strip_unquoted_backslash_escapes(command: str) -> str:
+    """Strip backslash-escapes ONLY outside quotes; keep quoted escapes.
+
+    Mirrors POSIX shell semantics: inside single quotes every character is
+    literal (backslash included); inside double quotes ``\\`` followed by
+    ``"``/``\\``/``$``/`` ` `` is an escape, but a backslash before any other
+    char stays as data. Rather than reimplementing the full grammar here,
+    we only strip escapes in unquoted positions and leave everything inside
+    quotes untouched — the downstream tokenizers (``_shell_tokens_with_spans``
+    / ``_quoted_grep_pattern_spans``) are quote-aware and will interpret
+    quoted backslashes correctly.
+
+    This prevents the flat ``re.sub(r'\\\\([^\\n])', ...)`` from unbalancing
+    quote pairs in benign commands like
+    ``grep "vector_runtime.py\\\", line 884" file`` where the escaped quote
+    is inside a quoted pattern (fork 849506054: approval quote-aware
+    backslash strip).
+    """
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                # Keep the backslash AND the escaped char verbatim so the
+                # tokenizer sees the intact `\"` / `\\` pair.
+                out.append(ch)
+                out.append(command[i + 1])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        # Unquoted position.
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            # Strip the escape: r\m → rm. Keep the escaped character.
+            out.append(command[i + 1])
+            i += 2
+            continue
+        if ch == "\\" and i + 1 >= n:
+            # Trailing lone backslash (line continuation already collapsed).
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command string before dangerous-pattern matching.
 
@@ -1043,7 +1181,17 @@ def _normalize_command_for_detection(command: str) -> str:
     command = _rewrite_resolved_hermes_home(command)
     command = _rewrite_resolved_user_home(command)
     # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
-    command = re.sub(r'\\([^\n])', r'\1', command)
+    # Quote-aware: inside a quoted string (single OR double), backslashes
+    # are data — `\"` in a double-quoted grep pattern is a literal quote,
+    # and `\'` inside single quotes is a literal apostrophe. Flat-stripping
+    # them here would break quote pairing for _shell_tokens_with_spans
+    # (e.g. `grep "vector_runtime.py\", line 884"` → the escaped quote gets
+    # unpaired, the tokenizer sees an unterminated quote, and a benign
+    # read-only command is hardline-blocked as "malformed executable
+    # payload"). Only strip escapes OUTSIDE quotes; leave quoted
+    # backslash sequences untouched so the downstream tokenizer can honor
+    # them. (fork 849506054: approval quote-aware backslash strip)
+    command = _strip_unquoted_backslash_escapes(command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
     command = re.sub(r"''|\"\"", '', command)
     # Collapse $IFS / ${IFS} word-separator expansions to a literal space.
@@ -1348,6 +1496,90 @@ _GREP_OPTIONS_WITH_ARG = {
 _GREP_SHORT_OPTIONS_WITH_ARG = {"A", "B", "C", "D", "d", "e", "f", "m"}
 
 
+def _inside_command_substitution(segment: str, pos: int) -> bool:
+    """True when *pos* lies inside a ``$( ... )`` or backtick ``...`` substitution.
+
+    Scan from the segment start, tracking quotes like the shell does, and
+    count substitution depth. A position is "inside" when a ``$(`` or backtick
+    opener before it has not yet been closed by its matching ``)`` / backtick.
+    Quotes inside the substitution may be nested; the scanner stays quote-aware
+    so a ``)`` inside quotes does not close the substitution early.
+    """
+    quote: str | None = None
+    depth = 0
+    i = 0
+    n = len(segment)
+    while i < n and i < pos:
+        ch = segment[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+            # "$(cmd)" executes the substitution even inside double quotes
+            # (matches _iter_shell_command_starts' handling).
+            if segment.startswith("$(", i):
+                depth += 1
+                i += 2
+                continue
+            if ch == "`":
+                # Backtick substitution also executes inside double quotes.
+                j = i + 1
+                while j < n:
+                    if segment[j] == "\\" and j + 1 < n:
+                        j += 2
+                        continue
+                    if segment[j] == "`":
+                        break
+                    j += 1
+                if pos < j + 1:
+                    return True
+                i = j + 1
+                continue
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if segment.startswith("$(", i):
+            depth += 1
+            i += 2
+            continue
+        if ch == "`":
+            # Backtick substitution: find the closing backtick (quote-aware),
+            # everything between is "inside".
+            j = i + 1
+            while j < n:
+                if segment[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if segment[j] == "`":
+                    break
+                j += 1
+            if pos < j + 1:
+                return True
+            i = j + 1
+            continue
+        if ch == ")":
+            depth -= 1
+            i += 1
+            continue
+        i += 1
+    return depth > 0
+
+
 def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], bool]:
     """Structurally locate quoted grep PCRE operands.
 
@@ -1364,6 +1596,17 @@ def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], boo
             if os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower() not in {
                 "grep", "egrep",
             }:
+                continue
+            # Skip grep/egrep words living inside $(...) / backtick command
+            # substitution. Such words belong to a NESTED subshell: their
+            # operands are parsed by _command_detection_variants' subcommand
+            # variants against the substitution's own local text. Running
+            # _shell_tokens_with_spans here would start from a position INSIDE
+            # a quoted parent string (e.g. "Authorization: Bearer $(grep ..."),
+            # see an unterminated quote, return None, and hardline-block a
+            # benign command as "malformed" (fork 849506054: approval skip
+            # grep words inside command substitution).
+            if _inside_command_substitution(segment, start):
                 continue
             tokens = _shell_tokens_with_spans(segment, start)
             if tokens is None:
@@ -2104,6 +2347,22 @@ def _command_detection_variants(command: str):
     grep_safe, _ = _grep_safe_detection_variant(normalized)
     seen = {grep_safe}
     yield grep_safe
+    # Windows-path variant (#69472): normalization treats backslashes as
+    # shell escapes and strips them, so `del C:\Users\me\.ssh\id_rsa`
+    # reaches the patterns as `del C:Usersme.sshid_rsa` — no path rule can
+    # ever match a backslash Windows path. When the RAW command contains a
+    # drive-letter or UNC backslash path, also yield a variant with
+    # backslashes flattened to forward slashes BEFORE normalization eats
+    # them. Gated on a real path shape (letter, colon, backslash — or
+    # double backslash UNC) so POSIX escape semantics (`echo a\"b`) are
+    # untouched on every other command.
+    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
+        win_variant = _normalize_command_for_detection(
+            _mask_quoted_newlines(command.replace("\\", "/"))
+        )
+        if win_variant not in seen:
+            seen.add(win_variant)
+            yield win_variant
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.
@@ -3601,6 +3860,166 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+def get_plugin_manager():
+    """Lazy plugin-manager seam used by tests and early tool-only imports."""
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager as _get_manager
+
+    # Approval can be imported before model_tools, whose import normally
+    # triggers general plugin discovery. Ensure an explicitly selected
+    # transport is available on that first approval rather than treating the
+    # still-undiscovered registry as an unavailable transport.
+    discover_plugins()
+    return _get_manager()
+
+
+def _get_approval_transport_config() -> tuple[str, str | None]:
+    """Return explicitly selected transport and fail-closed fallback mode."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        approval_config = ((config.get("security") or {}).get("approval") or {})
+        selected = str(approval_config.get("transport") or "builtin").strip().lower()
+        fallback = str(approval_config.get("transport_fallback") or "").strip().lower()
+    except Exception:
+        # An unreadable/malformed selection must not silently materialize a
+        # prompt on a built-in surface the operator may not be watching.
+        return "config-error", None
+    return selected or "builtin", "builtin" if fallback == "builtin" else None
+
+
+def _present_with_selected_transport(
+    *,
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+    surface: str,
+    allow_session: bool,
+    allow_permanent: bool,
+) -> dict:
+    """Present through an explicitly selected plugin transport, if any."""
+    name, fallback = _get_approval_transport_config()
+    if name == "builtin":
+        return {"selected": False}
+
+    try:
+        registered = get_plugin_manager().get_approval_transport(name)
+    except Exception:
+        # Plugin/discovery exception text may contain plugin-owned secrets.
+        logger.warning("Could not resolve selected approval transport %r", name)
+        registered = None
+    if registered is None:
+        logger.warning("Selected approval transport %r is unavailable", name)
+        return {
+            "selected": True,
+            "choice": "deny",
+            "failure": "unavailable",
+            "fallback": fallback,
+            "name": name,
+        }
+
+    try:
+        from agent.redact import redact_sensitive_text
+        from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
+
+        timeout_seconds = _get_approval_timeout()
+        request = ApprovalRequest.create(
+            command=redact_sensitive_text(command, force=True),
+            description=redact_sensitive_text(description, force=True),
+            pattern_key=pattern_key,
+            pattern_keys=tuple(pattern_keys),
+            session_key=session_key,
+            surface=surface,
+            allow_session=allow_session,
+            allow_permanent=allow_permanent,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        # Never fall back to raw text if redaction or request construction
+        # fails. The selected boundary exists, so fail closed without calling
+        # the plugin or leaking the unredacted payload to logs/hooks.
+        logger.warning("Could not build redacted plugin approval request")
+        return {
+            "selected": True,
+            "choice": "deny",
+            "failure": "error",
+            "fallback": None,
+            "name": name,
+        }
+    hook_surface = f"transport:{name}"
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=request.command,
+        description=request.description,
+        pattern_key=pattern_key,
+        pattern_keys=list(pattern_keys),
+        session_key=session_key,
+        surface=hook_surface,
+        request_id=request.request_id,
+        request_digest=request.digest,
+    )
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover - minimal tool-only environments
+        touch_activity_if_due = None
+    now = time.monotonic()
+    activity_state = {"last_touch": now, "start": now}
+
+    def _poll() -> None:
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(activity_state, "waiting for plugin approval transport")
+
+    with human_wait_window(session_key):
+        result = invoke_approval_transport(
+            registered.present,
+            request,
+            timeout_seconds=timeout_seconds,
+            on_poll=_poll,
+            is_interrupted=is_interrupted,
+        )
+    hook_choice = result.choice if result.failure is None else f"transport_{result.failure}"
+    _fire_approval_hook(
+        "post_approval_response",
+        command=request.command,
+        description=request.description,
+        pattern_key=pattern_key,
+        pattern_keys=list(pattern_keys),
+        session_key=session_key,
+        surface=hook_surface,
+        choice=hook_choice,
+        request_id=request.request_id,
+        request_digest=request.digest,
+    )
+    return {
+        "selected": True,
+        "choice": result.choice,
+        "failure": result.failure,
+        "fallback": fallback,
+        "name": name,
+    }
+
+
+def _transport_denied_result(
+    *, pattern_key: str, description: str, failure: str
+) -> dict:
+    breaker_addendum = _denial_breaker_addendum(get_current_session_key())
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: Selected approval transport failed ({failure}); the user "
+            "has NOT consented to this action. Do NOT retry this command or "
+            "attempt the same outcome through another route."
+            f"{breaker_addendum}"
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": f"transport_{failure}",
+        "user_consent": False,
+    }
+
+
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
@@ -3995,6 +4414,70 @@ def check_all_command_guards(command: str, env_type: str,
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
 
+    # An explicitly selected plugin transport replaces every built-in prompt
+    # surface (CLI/TUI/gateway/ACP). Detection, allowed scopes, persistence,
+    # timeout, and final authorization remain host-owned. A failed transport
+    # reaches a built-in surface only under the explicit fallback opt-in.
+    transport_attempt = _present_with_selected_transport(
+        command=command,
+        description=combined_desc,
+        pattern_key=primary_key,
+        pattern_keys=all_keys,
+        session_key=session_key,
+        surface="gateway" if (is_gateway or is_ask) else "cli",
+        allow_session=not smart_denied_for_owner,
+        allow_permanent=has_permanent_capable and not smart_denied_for_owner,
+    )
+    if transport_attempt.get("selected"):
+        transport_failure = transport_attempt.get("failure")
+        if transport_failure and transport_attempt.get("fallback") == "builtin":
+            logger.warning(
+                "Approval transport %r failed (%s); using explicit builtin fallback",
+                transport_attempt.get("name"),
+                transport_failure,
+            )
+        elif transport_failure:
+            return _transport_denied_result(
+                pattern_key=primary_key,
+                description=combined_desc,
+                failure=transport_failure,
+            )
+        else:
+            transport_choice = transport_attempt.get("choice")
+            if transport_choice == "deny":
+                _record_denial(session_key)
+                breaker_addendum = _denial_breaker_addendum(session_key)
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: User denied this command through the selected "
+                        "approval transport. The user has NOT consented to this "
+                        "action. Do NOT retry or attempt the same outcome through "
+                        f"another route.{breaker_addendum}"
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "denied",
+                    "user_consent": False,
+                }
+            if not smart_denied_for_owner:
+                for key, _, is_tirith in warnings:
+                    if transport_choice == "session" or (
+                        transport_choice == "always" and is_tirith
+                    ):
+                        approve_session(session_key, key)
+                    elif transport_choice == "always":
+                        approve_session(session_key, key)
+                        approve_permanent(key)
+                        save_permanent_allowlist(_permanent_approved)
+            _reset_denials(session_key)
+            return {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": combined_desc,
+            }
+
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
     # input() flow.  The agent never sees "approval_required"; it either
@@ -4357,6 +4840,60 @@ def check_execute_code_guard(code: str, env_type: str,
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(description)
+
+    transport_attempt = _present_with_selected_transport(
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="gateway",
+        allow_session=not smart_denied_for_owner,
+        allow_permanent=not smart_denied_for_owner,
+    )
+    if transport_attempt.get("selected"):
+        transport_failure = transport_attempt.get("failure")
+        if transport_failure and transport_attempt.get("fallback") == "builtin":
+            logger.warning(
+                "Approval transport %r failed (%s); using explicit builtin fallback",
+                transport_attempt.get("name"),
+                transport_failure,
+            )
+        elif transport_failure:
+            return _transport_denied_result(
+                pattern_key=pattern_key,
+                description=description,
+                failure=transport_failure,
+            )
+        else:
+            choice = transport_attempt.get("choice")
+            if choice == "deny":
+                _record_denial(session_key)
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: User denied execute_code through the selected "
+                        "approval transport. The user has NOT consented."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "denied",
+                    "user_consent": False,
+                }
+            if not smart_denied_for_owner:
+                if choice == "session":
+                    approve_session(session_key, pattern_key)
+                elif choice == "always":
+                    approve_session(session_key, pattern_key)
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
+            _reset_denials(session_key)
+            return {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": description,
+            }
 
     notify_cb = None
     with _lock:

@@ -542,6 +542,12 @@ export interface MessageReaction {
 }
 
 export interface SessionMessage {
+  /**
+   * Full tool arguments for a gateway-projected tool row (`role: 'tool'`).
+   * `context` is an 80-char display preview. The expanded tool row rebuilds
+   * the full call from this field. Absent on a backend older than this app.
+   */
+  args?: unknown
   codex_reasoning_items?: unknown
   content: unknown
   context?: unknown
@@ -549,7 +555,8 @@ export interface SessionMessage {
   reasoning?: null | string
   reasoning_content?: null | string
   reasoning_details?: unknown
-  display_kind?: 'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | string
+  display_kind?:
+    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.
@@ -1261,6 +1268,22 @@ export interface StaleAuxAssignment {
   model: string
 }
 
+export type CronModelDriftAxis = 'model' | 'provider'
+
+export interface CronModelImpactJob {
+  id: string
+  name: string
+  drifted_axes: CronModelDriftAxis[]
+}
+
+export interface CronModelImpact {
+  available: boolean
+  guard_enabled: boolean
+  affected_count: number
+  truncated: boolean
+  jobs: CronModelImpactJob[]
+}
+
 /** One skill-hub source (official index, GitHub, skills.sh, …) as reported by
  *  `GET /api/skills/hub/sources`. */
 export interface SkillHubSource {
@@ -1416,6 +1439,10 @@ export interface ModelAssignmentResponse {
    *  switching the main provider to Nous. Empty unless provider === 'nous'
    *  and the user is a paid subscriber with unconfigured tools. */
   gateway_tools?: string[]
+  /** Additive profile-local cron impact returned after a persisted main assignment. */
+  cron_model_impact?: CronModelImpact
+  confirm_message?: string
+  confirm_required?: boolean
   model?: string
   ok: boolean
   provider?: string

@@ -171,12 +171,25 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
+    "1. Has the user revealed preferences, work style, or expectations about "
+    "how you should behave? Capture only behaviour-affecting facts — NOT "
+    "generic personal details (family, job, hobbies, identity) unless they "
+    "change how future sessions should operate.\n"
     "2. Has the user expressed expectations about how you should behave, their work "
     "style, or ways they want you to operate?\n\n"
+    "If the learning is a procedure, technique, or task-class lesson, it "
+    "belongs in the skill library, NOT memory — leave it for the skill review.\n"
     "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "If nothing is worth saving, just say 'Nothing to save.' and stop.\n\n"
+    "MEMORY FORM IRON RULE (Fork customization 2026-08-15): memory entries "
+    "are allowed in exactly two shapes — (a) hard constraints (path/security/time "
+    "rules, repeatedly-corrected behaviour norms, high-frequency environment facts); "
+    "(b) pointer entries routing a problem class to its home (\"X-class issue -> skill "
+    "Y / PROJECT.md Z\", one line). FORBIDDEN: parameter values, case details, "
+    "dated event descriptions, anything already verifiable in any skill/references. "
+    "Details belong in the skill (SKILL.md body or references/), memory keeps only "
+    "the routing pointer. Never duplicate into memory what a skill already covers — "
+    "the skill list itself is injected every session and is the natural index."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -245,11 +258,12 @@ _SKILL_REVIEW_PROMPT = (
     "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
     "User-preference embedding (important): when the user expressed a "
     "style/format/workflow preference, the update belongs in the "
-    "SKILL.md body, not just in memory. Memory captures 'who the user "
-    "is and what the current situation and state of your operations "
-    "are'; skills capture 'how to do this class of task for this "
-    "user'. When they complain about how you handled a task, the "
-    "skill that governs that task needs to carry the lesson.\n\n"
+    "SKILL.md body, not just in memory. Memory holds only hard "
+    "constraints and one-line pointer entries — never current runtime "
+    "state, dated details, or anything verifiable in a skill; skills "
+    "capture 'how to do this class of task for this user'. When they "
+    "complain about how you handled a task, the skill that governs "
+    "that task needs to carry the lesson.\n\n"
     "If you notice two existing skills that overlap, note it in your "
     "reply — the background curator handles consolidation at scale.\n\n"
     "Protected skills (DO NOT edit these):\n"
@@ -309,7 +323,11 @@ _COMBINED_REVIEW_PROMPT = (
     "**Memory**: who the user is. Did the user reveal persona, "
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
+    "preferences with the memory tool. Memory entries must be one of "
+    "two shapes only: hard constraints, or one-line pointer entries "
+    "routing a problem class to its skill/PROJECT.md. Never duplicate "
+    "details that belong in a skill; memory keeps only the routing "
+    "pointer. (Fork customization 2026-08-15)\n\n"
     "**Skills**: how to do this class of task. Be ACTIVE — most "
     "sessions produce at least one skill update. A pass that does "
     "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
@@ -351,10 +369,13 @@ _COMBINED_REVIEW_PROMPT = (
     "(2), or (3).\n\n"
     "User-preference embedding: when the user complains about how "
     "you handled a task, update the skill that governs that task — "
-    "memory alone isn't enough. Memory says 'who the user is and "
-    "what the current situation and state of your operations are'; "
-    "skills say 'how to do this class of task for this user'. Both "
-    "should carry user-preference lessons when relevant.\n\n"
+    "memory alone isn't enough. Memory holds only hard constraints "
+    "and one-line pointer entries — never current runtime state, "
+    "dated details, or anything verifiable in a skill; skills say "
+    "'how to do this class of task for this user'. Each lesson has "
+    "one home: the skill carries the full detail, memory carries at "
+    "most a one-line pointer if the rule must stay resident — never "
+    "duplicate the same lesson in both.\n\n"
     "If you notice overlapping existing skills, mention it — the "
     "background curator handles consolidation.\n\n"
     "Protected skills (DO NOT edit these):\n"
@@ -903,6 +924,11 @@ def _run_review_in_thread(
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
+                # 2026-08-15 根治：必须构造时传入 session_id。此前漏传导致
+                # agent_init 走 fallback 生成 6-hex 临时 id 并经 set_current_session_id
+                # 写入进程级 os.environ（幽灵 id 污染源）。构造即绑定父会话 id，
+                # 杜绝临时 id 生成；下方 L971 的事后 pin 保留为防御性冗余。
+                session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
